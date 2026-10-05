@@ -147,6 +147,10 @@ template <typename T> struct is_tuple_t       : std::false_type {};
 template <typename... Ts> struct is_tuple_t<std::tuple<Ts...>> : std::true_type {};
 template <typename T> inline constexpr bool is_tuple_v = is_tuple_t<T>::value;
 
+template <typename T> struct is_optional_t    : std::false_type {};
+template <typename T> struct is_optional_t<std::optional<T>> : std::true_type {};
+template <typename T> inline constexpr bool is_optional_v = is_optional_t<T>::value;
+
 template <typename T> inline constexpr bool is_complex_v =
     is_vector_v<T> || is_pair_v<T> || is_tuple_v<T>;
 
@@ -880,6 +884,9 @@ T col_get_arg(const ColView& col, uint32_t row) {
 //                             floating point, 0 otherwise
 //   std::string, bytes_codec types → String column; NULL rows are empty
 //   std::vector / std::pair / std::tuple → COL_COMPLEX; NULL rows are T{}
+//   std::optional<T> (T arithmetic, std::string or bytes_codec) → Nullable(T);
+//                             NULL rows and std::nullopt are NULL.  Declare
+//                             the SQL result as Nullable(T).
 // The buffer is released if invoke throws, then the exception propagates.
 
 template <typename T>
@@ -897,9 +904,61 @@ struct buffer_guard {
     raw_buffer* release() { raw_buffer* b = buf; buf = nullptr; return b; }
 };
 
+// Nullable fixed-width result: [header][desc][null map u8[n]][pad to 8][T[n]].
+template <typename T, typename Get>
+raw_buffer* write_nullable_fixed_column(uint32_t n, Get get) {
+    const uint32_t null_base = HEADER_BYTES + COL_DESC_BYTES;
+    const uint32_t data_base = (null_base + n + 7u) & ~7u;
+    buffer_guard g{clickhouse_create_buffer(data_base + n * uint32_t(sizeof(T)))};
+    uint8_t* p = g.buf->data();
+    std::memset(p, 0, data_base + n * sizeof(T));
+    write_frame_header(p, n, 1);
+    ColDescriptor d{};
+    d.type        = fixed_col_tag<T>() | COL_IS_NULLABLE;
+    d.null_offset = null_base;
+    d.data_offset = data_base;
+    d.data_size   = uint64_t(n) * sizeof(T);
+    std::memcpy(p + HEADER_BYTES, &d, sizeof(d));
+    for (uint32_t i = 0; i < n; ++i) {
+        std::optional<T> v = get(i);
+        uint8_t* row = g.buf->data();
+        if (v) std::memcpy(row + data_base + uint64_t(i) * sizeof(T), &*v, sizeof(T));
+        else   row[null_base + i] = 1;
+    }
+    return g.release();
+}
+
 template <typename Ret, typename AnyNull, typename Invoke>
 raw_buffer* write_result_column(uint32_t n, AnyNull any_null, Invoke invoke) {
-    if constexpr (std::is_same_v<Ret, bool>) {
+    if constexpr (is_optional_v<Ret>) {
+        using T = typename Ret::value_type;
+        auto get = [&](uint32_t i) -> Ret { return any_null(i) ? Ret{} : Ret(invoke(i)); };
+        if constexpr (std::is_arithmetic_v<T>) {
+            if constexpr (std::is_same_v<T, bool>)
+                return write_nullable_fixed_column<uint8_t>(n, [&](uint32_t i) -> std::optional<uint8_t> {
+                    auto v = get(i);
+                    return v ? std::optional<uint8_t>(*v ? 1u : 0u) : std::nullopt;
+                });
+            else
+                return write_nullable_fixed_column<T>(n, get);
+        } else if constexpr (std::is_same_v<T, std::string> || BytesEncodable<T>) {
+            buffer_guard g{clickhouse_create_buffer(0)};
+            ColBytesWriter w(g.buf, n, /*nullable=*/true);
+            for (uint32_t i = 0; i < n; ++i) {
+                Ret v = get(i);
+                if (!v) { w.push_null(); continue; }
+                if constexpr (std::is_same_v<T, std::string>)
+                    w.push_bytes({reinterpret_cast<const uint8_t*>(v->data()), v->size()});
+                else
+                    w.push_value(*v);
+            }
+            w.finish();
+            return g.release();
+        } else {
+            static_assert(sizeof(T) == 0,
+                "write_result_column: std::optional supports arithmetic, std::string and bytes_codec types");
+        }
+    } else if constexpr (std::is_same_v<Ret, bool>) {
         buffer_guard g{clickhouse_create_buffer(HEADER_BYTES + COL_DESC_BYTES + n)};
         col_write_fixed_header<uint8_t>(g.buf, n, COL_FIXED8);
         uint8_t* res = g.buf->data() + HEADER_BYTES + COL_DESC_BYTES;

@@ -193,3 +193,68 @@ TEST(ColumnarCall, LowCardinalityStringArgument) {
     destroy(in);
     EXPECT_EQ(got, (std::vector<std::string>{"ALPHA", "BETA", "ALPHA", "GAMMA", "BETA", "ALPHA"}));
 }
+
+// ── std::optional results → Nullable(T) ─────────────────────────────────────
+
+namespace {
+
+std::optional<int64_t> parse_int(std::string_view s) {
+    int64_t v = 0;
+    if (s.empty()) return std::nullopt;
+    for (char c : s) {
+        if (c < '0' || c > '9') return std::nullopt;
+        v = v * 10 + (c - '0');
+    }
+    return v;
+}
+std::optional<std::string> non_empty(std::string_view s) {
+    if (s.empty()) return std::nullopt;
+    return std::string(s);
+}
+std::optional<bool> is_even(int32_t v) { return v % 2 == 0; }
+
+}  // namespace
+
+TEST(ColumnarCall, OptionalFixedResultIsNullable) {
+    auto* in = make_frame(4, {string_col({"12", "x", "", "7"}, {0, 0, 0, 1})});
+    auto* out = columnar_call(in, parse_int);
+    destroy(in);
+    auto cb = parse_columnar(out);
+    auto col = cb.col(0);
+    EXPECT_EQ(col.base_type, COL_FIXED64);
+    ASSERT_NE(col.null_map, nullptr);
+    EXPECT_FALSE(col.is_null(0));
+    EXPECT_EQ(col.get_fixed<int64_t>(0), 12);
+    EXPECT_TRUE(col.is_null(1));   // nullopt
+    EXPECT_TRUE(col.is_null(2));   // nullopt
+    EXPECT_TRUE(col.is_null(3));   // NULL argument
+    destroy(out);
+}
+
+TEST(ColumnarCall, OptionalStringResultIsNullable) {
+    auto* in = make_frame(3, {string_col({"a", "", "c"})});
+    auto* out = columnar_call(in, non_empty);
+    destroy(in);
+    auto cb = parse_columnar(out);
+    auto col = cb.col(0);
+    ASSERT_NE(col.null_map, nullptr);
+    EXPECT_FALSE(col.is_null(0));
+    EXPECT_TRUE(col.is_null(1));
+    EXPECT_FALSE(col.is_null(2));
+    auto s = col.get_bytes(2);
+    EXPECT_EQ(std::string(s.begin(), s.end()), "c");
+    destroy(out);
+}
+
+TEST(ColumnarCall, OptionalBoolResultIsNullableUInt8) {
+    auto* in = make_frame(3, {fixed_col<int32_t>({2, 3, 4}, {0, 0, 1})});
+    auto* out = columnar_call(in, is_even);
+    destroy(in);
+    auto cb = parse_columnar(out);
+    auto col = cb.col(0);
+    EXPECT_EQ(col.base_type, COL_FIXED8);
+    EXPECT_EQ(col.get_fixed<uint8_t>(0), 1);
+    EXPECT_EQ(col.get_fixed<uint8_t>(1), 0);
+    EXPECT_TRUE(col.is_null(2));
+    destroy(out);
+}

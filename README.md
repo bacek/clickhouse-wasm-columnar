@@ -61,6 +61,7 @@ argument and result types come from the C++ signature of `fn`.
 | `bool`, integers, `float`, `double` | the fixed-width type of the same size |
 | `std::string` | `String` |
 | `std::vector<T>`, `std::pair<A,B>`, `std::tuple<...>` | `Array(T)`, `Tuple(...)`, nested |
+| `std::optional<T>` (T a number, `std::string` or a `bytes_codec` type) | `Nullable(T)` |
 
 The wire format does not say whether a fixed-width column is signed or a float.
 Declare the SQL argument type to match the C++ type. Narrower integer columns are
@@ -69,9 +70,11 @@ ClickHouse sends as `UInt8`.
 
 ### NULL
 
-If any argument of a row is NULL, your function is not called for that row. The
-result for that row is NaN for floating-point results, `0` for other numbers, an
-empty string for strings, and `T{}` for arrays and tuples.
+If any argument of a row is NULL, your function is not called for that row. With
+a `std::optional<T>` result, that row is NULL, and so is every row where your
+function returns `std::nullopt`; declare the SQL result as `Nullable(T)`. Without
+`std::optional`, the result for that row is NaN for floating-point results, `0`
+for other numbers, an empty string for strings, and `T{}` for arrays and tuples.
 
 ## Your own types
 
@@ -134,6 +137,20 @@ target_link_options(mymodule PRIVATE -fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=
 
 ClickHouse's wasmtime runtime needs native WASM exceptions in the new `exnref`
 form. Emscripten 3.x uses `-sWASM_EXNREF=1` for this.
+
+`examples/demo.cpp` has five functions (strings, `Nullable`, arrays, tuples,
+errors) and `examples/demo.sql` registers them. Build it with Emscripten:
+
+```sh
+emcmake cmake -B build_wasm -G Ninja && ninja -C build_wasm   # build_wasm/examples/demo.wasm
+```
+
+`tests/e2e.py` loads the module into a running server, checks every function,
+and removes them again:
+
+```sh
+tests/e2e.py --clickhouse /path/to/clickhouse --wasm build_wasm/examples/demo.wasm --port 9000
+```
 
 Unit tests (native):
 
