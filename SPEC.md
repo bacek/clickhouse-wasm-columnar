@@ -111,6 +111,17 @@ Each record is 44 bytes: a `u8` discriminator, 3 bytes of padding, then a
 fields are frame offsets as usual, and the alternative's column is read with
 that row count.
 
+ClickHouse rejects a Variant column that breaks any of these rules:
+
+- `K` counts only non-empty alternatives. An alternative with no rows has no
+  record.
+- Each record's discriminator is a valid alternative index and appears in only
+  one record.
+- Every row with a discriminator other than `0xFF` has a record for that
+  discriminator, and its `row_offset` is less than that alternative's row count.
+- Every row of an alternative is referenced by exactly one `(discriminator,
+  row_offset)` pair.
+
 ## LowCardinality
 
 | Field | Contents |
