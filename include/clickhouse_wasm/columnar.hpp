@@ -32,6 +32,8 @@
 //
 // SQL: ABI COLUMNAR_V1  (no serialization_format needed)
 
+#include <clickhouse_wasm/wire.h>
+
 #include <algorithm>
 #include <array>
 #include <concepts>
@@ -191,6 +193,17 @@ static constexpr uint32_t FRAME_MAGIC   = 0x4E494243u;  // 'C' | 'B'<<8 | 'I'<<1
 static constexpr uint16_t FRAME_VERSION = 1;
 static constexpr uint32_t HEADER_BYTES  = 16;  // sizeof FrameHeader
 static constexpr uint32_t COL_DESC_BYTES = 40;  // sizeof ColDescriptor
+
+// Must agree with the plain-C description of the format in wire.h.
+static_assert(FRAME_MAGIC == CHW_FRAME_MAGIC && FRAME_VERSION == CHW_FRAME_VERSION);
+static_assert(HEADER_BYTES == CHW_HEADER_BYTES && COL_DESC_BYTES == CHW_COL_DESC_BYTES);
+static_assert(sizeof(ColDescriptor) == sizeof(chw_col_descriptor));
+static_assert(COL_BYTES == CHW_COL_BYTES && COL_FIXED8 == CHW_COL_FIXED8 &&
+              COL_FIXED16 == CHW_COL_FIXED16 && COL_FIXED32 == CHW_COL_FIXED32 &&
+              COL_FIXED64 == CHW_COL_FIXED64 && COL_COMPLEX == CHW_COL_COMPLEX &&
+              COL_VARIANT == CHW_COL_VARIANT && COL_FIXEDN == CHW_COL_FIXEDN &&
+              COL_LOWCARD == CHW_COL_LOWCARD && COL_IS_NULLABLE == CHW_COL_IS_NULLABLE &&
+              COL_IS_CONST == CHW_COL_IS_CONST);
 
 // Write the frame header at the start of an output buffer.
 inline void write_frame_header(uint8_t* p, uint32_t num_rows, uint32_t num_cols) {
