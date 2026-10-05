@@ -75,7 +75,8 @@ The fixed tags carry only a width. They do not say whether a value is signed,
 a float, a date or a decimal; the declared SQL type of the function says that.
 A width of 1, 2, 4 or 8 always uses `COL_FIXED8..64`, never `COL_FIXEDN`.
 
-In input frames, top-level fixed-width data starts at a frame offset that is a
+In input frames, fixed-width data with its own descriptor (a column, a Variant
+alternative, a LowCardinality dictionary; not data inside `COL_COMPLEX`) starts at a frame offset that is a
 multiple of the largest power of two dividing the width, at most 16. Values can
 be read in place if `clickhouse_create_buffer` returns 16-byte aligned memory.
 
