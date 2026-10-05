@@ -39,6 +39,7 @@
 #include <cstring>
 #include <exception>
 #include <limits>
+#include <map>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -47,6 +48,7 @@
 #include <tuple>
 #include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "abi.hpp"
@@ -151,8 +153,26 @@ template <typename T> struct is_optional_t    : std::false_type {};
 template <typename T> struct is_optional_t<std::optional<T>> : std::true_type {};
 template <typename T> inline constexpr bool is_optional_v = is_optional_t<T>::value;
 
+template <typename T> struct is_map_t         : std::false_type {};
+template <typename K, typename V> struct is_map_t<std::map<K,V>> : std::true_type {};
+template <typename T> inline constexpr bool is_map_v = is_map_t<T>::value;
+
+template <typename T> struct is_std_array_t   : std::false_type {};
+template <typename U, size_t N> struct is_std_array_t<std::array<U,N>> : std::true_type {};
+template <typename T> inline constexpr bool is_std_array_v = is_std_array_t<T>::value;
+
+template <typename T> struct is_variant_t     : std::false_type {};
+template <typename... Ts> struct is_variant_t<std::variant<Ts...>> : std::true_type {};
+template <typename T> inline constexpr bool is_variant_v = is_variant_t<T>::value;
+
+// A value stored as raw bytes of a known width: numbers, and std::array of
+// trivially copyable elements for FixedString(N), UUID, IPv6, Int128,
+// Decimal128/256 and the like.
+template <typename T> inline constexpr bool is_fixed_value_v =
+    std::is_arithmetic_v<T> || (is_std_array_v<T> && std::is_trivially_copyable_v<T>);
+
 template <typename T> inline constexpr bool is_complex_v =
-    is_vector_v<T> || is_pair_v<T> || is_tuple_v<T>;
+    is_vector_v<T> || is_pair_v<T> || is_tuple_v<T> || is_map_v<T>;
 
 // ── Wire structs ──────────────────────────────────────────────────────────────
 
@@ -196,6 +216,7 @@ struct ColView {
     uint32_t        fixed_width;  // COL_FIXED8/16/32/64: tag width;
                                   // COL_FIXEDN: data_size / row_count (0 if row_count == 0)
     const uint8_t*  base;         // buffer base — needed for absolute offset navigation
+    uint64_t        frame_size;   // bytes in the frame at `base`, for sub-column views
 
     // COL_LOWCARD only: the shared index array and the dictionary sub-column's
     // descriptor (absolute offsets into the same frame).  Populated by
@@ -263,6 +284,8 @@ struct ColView {
 
     // COL_LOWCARD with a COL_BYTES dictionary: the row's value bytes.
     std::span<const uint8_t> lc_get_bytes(uint32_t row) const {
+        if ((lc_dict.type & ~uint64_t(COL_IS_CONST | COL_IS_NULLABLE)) != COL_BYTES)
+            panic("columnar: LowCardinality dictionary is not a String column");
         uint64_t e = lc_index_at(row);
         if (e >= lc_dict_rows)
             panic("columnar: LowCardinality index exceeds dictionary");
@@ -323,8 +346,16 @@ struct ColumnarBuf {
     // out-of-frame bytes without any error — see the ColumnBinaryWire.h
     // read-side branches, which validate every untrusted offset the same way.
     ColView col(uint32_t i) const {
+        if (i >= num_cols)
+            panic("columnar: column index out of range");
         ColDescriptor d;
         std::memcpy(&d, descs + i, sizeof(d));
+        return view(d, num_rows);
+    }
+
+    // Resolve any descriptor in this frame (a top-level column, a Variant
+    // alternative, a LowCardinality dictionary) holding `rows` rows.
+    ColView view(const ColDescriptor& d, uint32_t rows) const {
 
         // Stray bits above the flags (anything but base-tag low bits, 0x20, 0x80).
         if (d.type & ~(uint64_t)(COL_IS_CONST | COL_IS_NULLABLE | 0x0Fu))
@@ -355,7 +386,7 @@ struct ColumnarBuf {
         ColView v{};
         v.is_const  = (d.type & COL_IS_CONST) != 0;
         v.base_type = static_cast<ColType>(base_tag);
-        v.row_count = v.is_const ? 1u : num_rows;
+        v.row_count = v.is_const ? 1u : rows;
 
         // Every extent below is checked against the frame size before any
         // pointer is formed from an untrusted offset.  0 keeps its "absent"
@@ -426,6 +457,7 @@ struct ColumnarBuf {
         v.data      = base + d.data_offset;
         v.data_size = d.data_size;
         v.base      = base;
+        v.frame_size = total_bytes;
 
         if (base_tag == COL_LOWCARD)
             load_lowcard(v, d);
@@ -475,20 +507,17 @@ private:
             panic("columnar: LowCardinality dictionary must not set COL_IS_CONST");
         if (dict.type & COL_IS_NULLABLE)
             panic("columnar: LowCardinality dictionary must not set COL_IS_NULLABLE");
-        // Only string-shaped dictionaries are decoded: that is the sole shape
-        // any consumer of a LowCardinality argument asks for.
-        if ((dict.type & ~uint64_t(COL_IS_CONST | COL_IS_NULLABLE)) != COL_BYTES)
-            panic("columnar: LowCardinality dictionary is not COL_BYTES");
+        // A dictionary is a plain column of T: neither another dictionary
+        // nor a Variant can sit inside LowCardinality.
+        const uint64_t dict_tag = dict.type & ~uint64_t(COL_IS_CONST | COL_IS_NULLABLE);
+        if (dict_tag == COL_LOWCARD || dict_tag == COL_VARIANT)
+            panic("columnar: LowCardinality dictionary has an unsupported column tag");
         // ColumnUnique reserves the leading default slot, so a real dictionary
         // is never empty.
         if (dict_rows < 1u)
             panic("columnar: LowCardinality dictionary is empty");
-        if (dict.offsets_offset > total_bytes ||
-            (uint64_t(dict_rows) + 1u) * sizeof(uint64_t) > total_bytes - dict.offsets_offset)
-            panic("columnar: LowCardinality dictionary offsets exceed frame");
-        if (dict.data_offset > total_bytes ||
-            dict.data_size > total_bytes - dict.data_offset)
-            panic("columnar: LowCardinality dictionary data exceeds frame");
+        // Validates every extent of the dictionary against the frame.
+        (void)view(dict, dict_rows);
 
         // offsets_offset is the shared index array.
         v.lc_index        = base + d.offsets_offset;
@@ -528,6 +557,15 @@ inline ColumnarBuf parse_columnar(const raw_buffer* buf) {
         panic("columnar: descriptor table extends past end of frame");
     cb.descs = reinterpret_cast<const ColDescriptor*>(p + HEADER_BYTES);
     return cb;
+}
+
+// The dictionary of a COL_LOWCARD column as a column of its own; a row's
+// value is lowcard_dictionary(col) at row col.lc_index_at(row).
+inline ColView lowcard_dictionary(const ColView& col) {
+    if (col.base_type != COL_LOWCARD)
+        panic("columnar: lowcard_dictionary on a column that is not LowCardinality");
+    ColumnarBuf frame{0, 0, col.frame_size, nullptr, col.base};
+    return frame.view(col.lc_dict, col.lc_dict_rows);
 }
 
 // ── Output writers ────────────────────────────────────────────────────────────
@@ -629,7 +667,7 @@ struct ColBytesWriter {
 
 template <typename T, typename GetVal>
 void write_complex_data(raw_buffer* out, uint32_t n, GetVal get_val) {
-    if constexpr (std::is_arithmetic_v<T> && !std::is_same_v<T, bool>) {
+    if constexpr (is_fixed_value_v<T>) {
         for (uint32_t i = 0; i < n; ++i) {
             T v = get_val(i);
             out->append(reinterpret_cast<const uint8_t*>(&v), sizeof(T));
@@ -664,6 +702,20 @@ void write_complex_data(raw_buffer* out, uint32_t n, GetVal get_val) {
             if (encoded[i])
                 out->append(reinterpret_cast<const uint8_t*>(encoded[i]->data()),
                             static_cast<uint32_t>(encoded[i]->size()));
+    } else if constexpr (is_optional_v<T>) {
+        // Nullable(E): u8 null_map[n], then n values of E (a NULL row holds E{}).
+        using E = typename T::value_type;
+        std::vector<T> rows(n);
+        for (uint32_t i = 0; i < n; ++i) rows[i] = get_val(i);
+        for (uint32_t i = 0; i < n; ++i) out->push_back(rows[i] ? 0u : 1u);
+        write_complex_data<E>(out, n, [&](uint32_t i) -> E { return rows[i] ? *rows[i] : E{}; });
+    } else if constexpr (is_map_v<T>) {
+        // Map(K, V) is Array(Tuple(K, V)) on the wire.
+        using Entries = std::vector<std::pair<typename T::key_type, typename T::mapped_type>>;
+        write_complex_data<Entries>(out, n, [&](uint32_t i) -> Entries {
+            const T& m = get_val(i);
+            return Entries(m.begin(), m.end());
+        });
     } else if constexpr (is_vector_v<T>) {
         using ElemT = typename T::value_type;
         // Collect all rows, write outer offsets, flatten elements, recurse.
@@ -697,24 +749,27 @@ void write_complex_data(raw_buffer* out, uint32_t n, GetVal get_val) {
 }
 
 // Write a single-column COL_COMPLEX output buffer from n invocations of get_val.
+// With `null_map` (u8[n], 1 = NULL) the column is Nullable — ClickHouse
+// accepts that for Tuple results only.
 template <typename Ret, typename GetVal>
-raw_buffer* write_complex_col(uint32_t n, GetVal get_val) {
+raw_buffer* write_complex_col(uint32_t n, GetVal get_val, const uint8_t* null_map = nullptr) {
     raw_buffer* out = clickhouse_create_buffer(0);
-    out->resize(HEADER_BYTES + COL_DESC_BYTES);
-    uint8_t* p = out->data();
-    write_frame_header(p, n, 1);
+    uint64_t data_offset = HEADER_BYTES + COL_DESC_BYTES;
     ColDescriptor d{};
     d.type = static_cast<uint32_t>(COL_COMPLEX);
-    if constexpr (is_vector_v<Ret>) {
-        // Array: outer uint64[n+1] offsets at data_offset, nested data follows immediately.
-        d.offsets_offset = 0;
-        d.data_offset    = HEADER_BYTES + COL_DESC_BYTES;
-    } else {
-        // Tuple/pair/scalar: no outer offsets, data starts immediately.
-        d.offsets_offset = 0u;
-        d.data_offset    = HEADER_BYTES + COL_DESC_BYTES;
+    if (null_map) {
+        d.type       |= COL_IS_NULLABLE;
+        d.null_offset = data_offset;
+        data_offset   = (data_offset + n + 7u) & ~uint64_t(7u);
     }
+    // The data blob starts with the outer offsets for an Array, the first
+    // field for a Tuple; offsets_offset stays 0 either way.
+    d.data_offset = data_offset;
+    out->resize(uint32_t(data_offset));
+    uint8_t* p = out->data();
+    write_frame_header(p, n, 1);
     std::memcpy(p + HEADER_BYTES, &d, sizeof(d));
+    if (null_map) std::memcpy(p + d.null_offset, null_map, n);
 
     std::vector<Ret> vals(n);
     for (uint32_t i = 0; i < n; ++i) vals[i] = get_val(i);
@@ -722,62 +777,150 @@ raw_buffer* write_complex_col(uint32_t n, GetVal get_val) {
         [&](uint32_t i) -> const Ret& { return vals[i]; });
 
     // Patch data_size (at byte offset 32 within ColDescriptor = HEADER_BYTES+32 in buf)
-    uint64_t data_size = static_cast<uint64_t>(out->size() - (HEADER_BYTES + COL_DESC_BYTES));
+    uint64_t data_size = static_cast<uint64_t>(out->size() - data_offset);
     std::memcpy(out->data() + HEADER_BYTES + 32u, &data_size, 8u);
     return out;
 }
 
-// ── COL_COMPLEX array reader ──────────────────────────────────────────────────
-// Reads one row of an Array(T) COL_COMPLEX column.
-// Wire layout (see COL_COMPLEX comment in ColType):
-//   col.offsets → uint64[row_count+1] outer offsets (cumulative element counts)
-//   col.data    → element data:
-//     Array(String): uint64[M_total+1] inner_offsets + bytes (no terminator)
-//     Array(arithmetic): ElemT[M_total] packed
+// ── COL_COMPLEX reader ───────────────────────────────────────────────────────
+//
+// A COL_COMPLEX data blob is a recursive block holding n values of T
+// (ColumnBinaryWire.h, writeComplexData):
+//   fixed T            T[n]
+//   String             uint64 offsets[n+1] (offsets[0] = 0) + chars
+//   Array(E)           uint64 offsets[n+1] + block of offsets[n] values of E
+//   Tuple(E0, E1, ..)  block of n E0, then block of n E1, ...
+//   Nullable(E)        u8 null_map[n] + block of n E
+//   Map(K, V)          as Array(Tuple(K, V))
+// Every offset is checked against the block before it is used.
 
+struct complex_block {
+    const uint8_t* data;
+    uint64_t       size;
+
+    complex_block from(uint64_t off) const {
+        if (off > size) panic("columnar: complex block extends past its column data");
+        return {data + off, size - off};
+    }
+    uint64_t u64(uint64_t i) const {
+        if (i >= size / 8u) panic("columnar: complex offsets extend past the column data");
+        uint64_t v;
+        std::memcpy(&v, data + i * 8u, 8u);
+        return v;
+    }
+};
+
+template <typename T> uint64_t complex_size(complex_block b, uint64_t n);
+template <typename T> T        complex_get(complex_block b, uint64_t n, uint64_t i);
+
+template <typename T>
+inline constexpr bool is_bytes_value_v =
+    std::is_same_v<T, std::string> || std::is_same_v<T, std::string_view> ||
+    std::is_same_v<T, std::span<const uint8_t>> || BytesDecodable<T>;
+
+template <typename Tuple, size_t I>
+uint64_t complex_field_offset(complex_block b, uint64_t n) {
+    uint64_t off = 0;
+    [&]<size_t... J>(std::index_sequence<J...>) {
+        ((off += complex_size<std::tuple_element_t<J, Tuple>>(b.from(off), n)), ...);
+    }(std::make_index_sequence<I>{});
+    return off;
+}
+
+template <typename T>
+uint64_t complex_size(complex_block b, uint64_t n) {
+    if constexpr (is_fixed_value_v<T>) {
+        if (n > b.size / sizeof(T)) panic("columnar: fixed-width block extends past the column data");
+        return n * sizeof(T);
+    } else if constexpr (is_bytes_value_v<T>) {
+        uint64_t chars = b.u64(n);
+        uint64_t head  = (n + 1u) * 8u;
+        if (chars > b.size - head) panic("columnar: string block extends past the column data");
+        return head + chars;
+    } else if constexpr (is_vector_v<T>) {
+        uint64_t m    = b.u64(n);
+        uint64_t head = (n + 1u) * 8u;
+        return head + complex_size<typename T::value_type>(b.from(head), m);
+    } else if constexpr (is_map_v<T>) {
+        return complex_size<std::vector<std::pair<typename T::key_type, typename T::mapped_type>>>(b, n);
+    } else if constexpr (is_optional_v<T>) {
+        if (n > b.size) panic("columnar: null map extends past the column data");
+        return n + complex_size<typename T::value_type>(b.from(n), n);
+    } else if constexpr (is_pair_v<T>) {
+        return complex_size<std::tuple<typename T::first_type, typename T::second_type>>(b, n);
+    } else if constexpr (is_tuple_v<T>) {
+        return complex_field_offset<T, std::tuple_size_v<T>>(b, n);
+    } else {
+        static_assert(sizeof(T) == 0, "complex_size: unsupported element type");
+    }
+}
+
+template <typename T>
+T complex_get(complex_block b, uint64_t n, uint64_t i) {
+    if (i >= n) panic("columnar: complex row index out of range");
+    if constexpr (is_fixed_value_v<T>) {
+        if (n > b.size / sizeof(T)) panic("columnar: fixed-width block extends past the column data");
+        T v;
+        std::memcpy(&v, b.data + i * sizeof(T), sizeof(T));
+        return v;
+    } else if constexpr (is_bytes_value_v<T>) {
+        uint64_t head = (n + 1u) * 8u;
+        uint64_t s = b.u64(i), e = b.u64(i + 1);
+        complex_block chars = b.from(head);
+        if (s > e || e > chars.size) panic("columnar: string offsets out of order or past the data");
+        std::span<const uint8_t> bytes{chars.data + s, static_cast<size_t>(e - s)};
+        if constexpr (std::is_same_v<T, std::span<const uint8_t>>) return bytes;
+        else if constexpr (std::is_same_v<T, std::string_view> || std::is_same_v<T, std::string>)
+            return T(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        else return bytes_codec<T>::decode(bytes);
+    } else if constexpr (is_vector_v<T>) {
+        using E = typename T::value_type;
+        uint64_t m = b.u64(n);
+        uint64_t s = b.u64(i), e = b.u64(i + 1);
+        if (s > e || e > m) panic("columnar: array offsets out of order or past the elements");
+        complex_block inner = b.from((n + 1u) * 8u);
+        T out;
+        out.reserve(e - s);
+        for (uint64_t j = s; j < e; ++j) out.push_back(complex_get<E>(inner, m, j));
+        return out;
+    } else if constexpr (is_map_v<T>) {
+        using K = typename T::key_type;
+        using V = typename T::mapped_type;
+        auto entries = complex_get<std::vector<std::pair<K, V>>>(b, n, i);
+        T out;
+        for (auto& kv : entries) out.insert_or_assign(std::move(kv.first), std::move(kv.second));
+        return out;
+    } else if constexpr (is_optional_v<T>) {
+        if (n > b.size) panic("columnar: null map extends past the column data");
+        if (b.data[i]) return std::nullopt;
+        return complex_get<typename T::value_type>(b.from(n), n, i);
+    } else if constexpr (is_pair_v<T>) {
+        using Tup = std::tuple<typename T::first_type, typename T::second_type>;
+        auto t = complex_get<Tup>(b, n, i);
+        return T(std::move(std::get<0>(t)), std::move(std::get<1>(t)));
+    } else if constexpr (is_tuple_v<T>) {
+        return [&]<size_t... J>(std::index_sequence<J...>) {
+            return T(complex_get<std::tuple_element_t<J, T>>(
+                b.from(complex_field_offset<T, J>(b, n)), n, i)...);
+        }(std::make_index_sequence<std::tuple_size_v<T>>{});
+    } else {
+        static_assert(sizeof(T) == 0, "complex_get: unsupported element type");
+    }
+}
+
+// The row of a top-level COL_COMPLEX column (Array, Tuple or Map) as T.
+template <typename T>
+T col_get_complex(const ColView& col, uint32_t row) {
+    if (col.base_type != COL_COMPLEX)
+        panic("columnar: Array/Tuple/Map argument against a column that is not COL_COMPLEX");
+    return complex_get<T>({col.data, col.data_size}, col.row_count, col.effective_row(row));
+}
+
+// One row of an Array(T) column.  Kept as the element-typed spelling of
+// col_get_complex<std::vector<ElemT>>.
 template <typename ElemT>
 std::vector<ElemT> col_get_complex_array(const ColView& col, uint32_t row) {
-    uint32_t idx                = col.effective_row(row);
-    const uint64_t* outer_offs  = reinterpret_cast<const uint64_t*>(col.data);
-    uint64_t outer_start        = outer_offs[idx];
-    uint64_t outer_end          = outer_offs[idx + 1];
-    uint64_t M_total            = outer_offs[col.row_count];
-    uint64_t count              = outer_end - outer_start;
-    const uint8_t* inner_data   = col.data + (col.row_count + 1u) * sizeof(uint64_t);
-
-    std::vector<ElemT> result;
-    result.reserve(count);
-
-    if constexpr (std::is_same_v<ElemT, std::span<const uint8_t>> || BytesDecodable<ElemT>) {
-        // Array(String): inner_data = [uint64[M_total+1] inner_offs][bytes]
-        const uint64_t* inner_offs = reinterpret_cast<const uint64_t*>(inner_data);
-        const uint8_t*  chars      = inner_data + (M_total + 1u) * sizeof(uint64_t);
-        for (uint64_t j = outer_start; j < outer_end; ++j) {
-            uint64_t s   = inner_offs[j];
-            uint64_t e   = inner_offs[j + 1];
-            uint64_t len = e - s;
-            std::span<const uint8_t> sp{chars + s, static_cast<size_t>(len)};
-            if constexpr (std::is_same_v<ElemT, std::span<const uint8_t>>)
-                result.push_back(sp);
-            else
-                result.push_back(bytes_codec<ElemT>::decode(sp));
-        }
-    } else if constexpr (std::is_arithmetic_v<ElemT>) {
-        // Array(numeric): inner_data = ElemT[M_total] packed
-        const ElemT* data_ptr = reinterpret_cast<const ElemT*>(inner_data);
-        for (uint32_t j = outer_start; j < outer_end; ++j)
-            result.push_back(data_ptr[j]);
-    } else if constexpr (std::is_same_v<ElemT, std::string>) {
-        const uint64_t* inner_offs = reinterpret_cast<const uint64_t*>(inner_data);
-        const uint8_t*  chars      = inner_data + (M_total + 1u) * sizeof(uint64_t);
-        for (uint64_t j = outer_start; j < outer_end; ++j) {
-            uint64_t s   = inner_offs[j];
-            uint64_t e   = inner_offs[j + 1];
-            uint64_t len = e - s;
-            result.push_back(std::string(reinterpret_cast<const char*>(chars + s), len));
-        }
-    }
-    return result;
+    return col_get_complex<std::vector<ElemT>>(col, row);
 }
 
 // ── Input column accessor by type ─────────────────────────────────────────────
@@ -845,34 +988,126 @@ inline std::span<const uint8_t> col_get_span_arg(const ColView& col, uint32_t ro
         case COL_FIXED64:
         case COL_FIXEDN:
             return col.get_fixed_bytes(row);
-        case COL_LOWCARD:
-            return col.lc_get_bytes(row);
+        case COL_LOWCARD: {
+            if ((col.lc_dict.type & ~uint64_t(COL_IS_CONST | COL_IS_NULLABLE)) == COL_BYTES)
+                return col.lc_get_bytes(row);
+            uint64_t e = col.lc_index_at(row);
+            if (e >= col.lc_dict_rows)
+                panic("columnar: LowCardinality index exceeds dictionary");
+            return col_get_span_arg(lowcard_dictionary(col), uint32_t(e));
+        }
         default:
             panic("columnar: span argument against an unsupported column tag");
     }
 }
 
+template <typename T> T col_get_arg(const ColView& col, uint32_t row);
+
+// ── Variant arguments ─────────────────────────────────────────────────────────
+//
+// A COL_VARIANT column stores, per row, the global discriminator (0xFF =
+// NULL) and the row's position inside its alternative; each alternative is
+// an ordinary column described by a record in the header at data_offset:
+//   uint32 K, then K x { uint8 discriminator, pad[3], ColDescriptor }
+// where the record's null_offset carries the alternative's row count.
+// ClickHouse orders alternatives by type name, and the discriminator is the
+// position in that order: declare std::variant<...> in the same order.
+
+struct VariantRow {
+    uint8_t  discriminator;  // 0xFF for NULL
+    ColView  alternative;    // the alternative's column (invalid when NULL)
+    uint32_t offset;         // the row's position in `alternative`
+};
+
+inline VariantRow variant_row(const ColView& col, uint32_t row) {
+    if (col.base_type != COL_VARIANT)
+        panic("columnar: Variant argument against a column that is not COL_VARIANT");
+    if (!col.null_map || !col.offsets)
+        panic("columnar: COL_VARIANT column without discriminators or row offsets");
+    VariantRow r{col.null_map[col.effective_row(row)], ColView{}, 0};
+    if (r.discriminator == 0xFFu) return r;
+    r.offset = col.variant_offset_at(row);
+
+    constexpr uint64_t record_bytes = 4u + COL_DESC_BYTES;
+    if (col.data_size < 4u) panic("columnar: COL_VARIANT header truncated");
+    uint32_t k;
+    std::memcpy(&k, col.data, 4);
+    if (uint64_t(k) * record_bytes > col.data_size - 4u)
+        panic("columnar: COL_VARIANT header records extend past the column data");
+    for (uint32_t i = 0; i < k; ++i) {
+        const uint8_t* rec = col.data + 4u + uint64_t(i) * record_bytes;
+        if (rec[0] != r.discriminator) continue;
+        ColDescriptor inner;
+        std::memcpy(&inner, rec + 4u, COL_DESC_BYTES);
+        uint64_t rows = inner.null_offset;  // repurposed: alternative row count
+        if (rows > UINT32_MAX) panic("columnar: COL_VARIANT alternative row count too large");
+        inner.null_offset = 0;
+        // Confine the alternative to this column's own data region.
+        ColumnarBuf region{0, 0, uint64_t(col.data - col.base) + col.data_size, nullptr, col.base};
+        r.alternative = region.view(inner, uint32_t(rows));
+        if (r.offset >= rows) panic("columnar: COL_VARIANT row offset past its alternative");
+        return r;
+    }
+    panic("columnar: COL_VARIANT row refers to an alternative missing from the header");
+}
+
+template <typename V, size_t I = 0>
+V variant_from_row(const VariantRow& r) {
+    if constexpr (I < std::variant_size_v<V>) {
+        if (r.discriminator == I)
+            return V(std::in_place_index<I>,
+                     col_get_arg<std::variant_alternative_t<I, V>>(r.alternative, r.offset));
+        return variant_from_row<V, I + 1>(r);
+    } else {
+        panic("columnar: Variant discriminator has no matching std::variant alternative");
+    }
+}
+
+// ── Typed argument reader ─────────────────────────────────────────────────────
+
 template <typename T>
 T col_get_arg(const ColView& col, uint32_t row) {
     if constexpr (requires { { column_reader<T>::read(col, row) } -> std::same_as<T>; }) {
         return column_reader<T>::read(col, row);
-    } else if constexpr (is_vector_v<T>) {
-        return col_get_complex_array<typename T::value_type>(col, row);
+    } else if constexpr (is_optional_v<T>) {
+        // Nullable(T) argument: NULL arrives as std::nullopt.
+        if (col.is_null(row)) return std::nullopt;
+        return col_get_arg<typename T::value_type>(col, row);
     } else if constexpr (std::is_same_v<T, std::span<const uint8_t>>) {
         return col_get_span_arg(col, row);
-    } else if constexpr (std::is_same_v<T, std::string_view>) {
+    } else if constexpr (std::is_same_v<T, std::string_view> || std::is_same_v<T, std::string>) {
         auto s = col_get_span_arg(col, row);
-        return {reinterpret_cast<const char*>(s.data()), s.size()};
-    } else if constexpr (std::is_same_v<T, std::string>) {
-        auto s = col_get_span_arg(col, row);
-        return {reinterpret_cast<const char*>(s.data()), s.size()};
-    } else if constexpr (std::is_arithmetic_v<T>) {
-        return col_get_fixed_widened<T>(col, row);
-    } else if constexpr (BytesDecodable<T>) {
-        return bytes_codec<T>::decode(col_get_span_arg(col, row));
+        return T(reinterpret_cast<const char*>(s.data()), s.size());
     } else {
-        static_assert(sizeof(T) == 0,
-            "col_get_arg: unsupported argument type; specialize ch::column_reader or ch::bytes_codec");
+        // Any other type over a LowCardinality column reads the dictionary.
+        if (col.base_type == COL_LOWCARD) {
+            uint64_t e = col.lc_index_at(row);
+            if (e >= col.lc_dict_rows)
+                panic("columnar: LowCardinality index exceeds dictionary");
+            return col_get_arg<T>(lowcard_dictionary(col), uint32_t(e));
+        }
+        if constexpr (is_variant_v<T>) {
+            VariantRow r = variant_row(col, row);
+            if (r.discriminator == 0xFFu)
+                panic("columnar: NULL Variant row passed to a non-optional argument");
+            return variant_from_row<T>(r);
+        } else if constexpr (is_complex_v<T>) {
+            return col_get_complex<T>(col, row);
+        } else if constexpr (std::is_arithmetic_v<T>) {
+            return col_get_fixed_widened<T>(col, row);
+        } else if constexpr (is_fixed_value_v<T>) {
+            auto bytes = col.get_fixed_bytes(row);
+            if (bytes.size() != sizeof(T))
+                panic("columnar: fixed-width column does not match the argument's size");
+            T v;
+            std::memcpy(&v, bytes.data(), sizeof(T));
+            return v;
+        } else if constexpr (BytesDecodable<T>) {
+            return bytes_codec<T>::decode(col_get_span_arg(col, row));
+        } else {
+            static_assert(sizeof(T) == 0,
+                "col_get_arg: unsupported argument type; specialize ch::column_reader or ch::bytes_codec");
+        }
     }
 }
 
@@ -895,7 +1130,7 @@ inline constexpr uint32_t fixed_col_tag() {
     else if constexpr (sizeof(T) == 2) return COL_FIXED16;
     else if constexpr (sizeof(T) == 4) return COL_FIXED32;
     else if constexpr (sizeof(T) == 8) return COL_FIXED64;
-    else static_assert(sizeof(T) == 0, "fixed_col_tag: unsupported width");
+    else return COL_FIXEDN;
 }
 
 struct buffer_guard {
@@ -929,11 +1164,100 @@ raw_buffer* write_nullable_fixed_column(uint32_t n, Get get) {
 }
 
 template <typename Ret, typename AnyNull, typename Invoke>
+raw_buffer* write_result_column(uint32_t n, AnyNull any_null, Invoke invoke);
+
+// Variant result: alternative I of the std::variant is global discriminator
+// I, so order the alternatives the way ClickHouse orders the Variant's types
+// (by type name).  A NULL argument row becomes a NULL Variant row.  Each
+// alternative is written as an ordinary column into the variant's data region.
+template <typename V, typename AnyNull, typename Invoke>
+raw_buffer* write_variant_column(uint32_t n, AnyNull any_null, Invoke invoke) {
+    constexpr size_t K = std::variant_size_v<V>;
+    static_assert(K <= 255, "a Variant has at most 255 alternatives");
+    std::vector<uint8_t>  discs(n, 0xFFu);
+    std::vector<uint32_t> offs(n, 0u);
+    std::vector<V>        vals;
+    vals.reserve(n);
+    std::array<uint32_t, K> counts{};
+    for (uint32_t i = 0; i < n; ++i) {
+        if (any_null(i)) continue;
+        V v = invoke(i);
+        discs[i] = uint8_t(v.index());
+        offs[i]  = counts[v.index()]++;
+        vals.push_back(std::move(v));
+    }
+
+    // One complete single-column frame per non-empty alternative.
+    std::array<raw_buffer*, K> subs{};
+    struct guard_all { std::array<raw_buffer*, K>& b; ~guard_all() {
+        for (auto* p : b) if (p) clickhouse_destroy_buffer(reinterpret_cast<uint8_t*>(p)); } } g_subs{subs};
+    [&]<size_t... I>(std::index_sequence<I...>) {
+        ([&] {
+            if (counts[I] == 0) return;
+            using A = std::variant_alternative_t<I, V>;
+            std::vector<const A*> rows;
+            rows.reserve(counts[I]);
+            for (const auto& v : vals) if (v.index() == I) rows.push_back(&std::get<I>(v));
+            subs[I] = write_result_column<A>(counts[I], [](uint32_t) { return false; },
+                                             [&](uint32_t r) -> A { return *rows[r]; });
+        }(), ...);
+    }(std::make_index_sequence<K>{});
+
+    uint32_t k = 0;
+    for (auto* b : subs) k += b ? 1u : 0u;
+    constexpr uint64_t record_bytes = 4u + COL_DESC_BYTES;
+    constexpr uint64_t sub_payload  = HEADER_BYTES + COL_DESC_BYTES;  // payload start in a sub-frame
+
+    const uint64_t disc_off = HEADER_BYTES + COL_DESC_BYTES;
+    const uint64_t offs_off = (disc_off + n + 3u) & ~uint64_t(3u);
+    const uint64_t data_off = (offs_off + uint64_t(n) * 4u + 7u) & ~uint64_t(7u);
+    uint64_t pos = (data_off + 4u + k * record_bytes + 7u) & ~uint64_t(7u);
+    std::array<uint64_t, K> placed{};
+    for (size_t i = 0; i < K; ++i) {
+        if (!subs[i]) continue;
+        placed[i] = pos;
+        pos = (pos + (subs[i]->size() - sub_payload) + 7u) & ~uint64_t(7u);
+    }
+    if (pos > UINT32_MAX) panic("columnar: Variant result frame exceeds 4 GiB");
+
+    buffer_guard g{clickhouse_create_buffer(uint32_t(pos))};
+    uint8_t* p = g.buf->data();
+    std::memset(p, 0, pos);
+    write_frame_header(p, n, 1);
+    ColDescriptor d{};
+    d.type           = COL_VARIANT;
+    d.null_offset    = disc_off;
+    d.offsets_offset = offs_off;
+    d.data_offset    = data_off;
+    d.data_size      = pos - data_off;
+    std::memcpy(p + HEADER_BYTES, &d, sizeof(d));
+    std::memcpy(p + disc_off, discs.data(), n);
+    std::memcpy(p + offs_off, offs.data(), uint64_t(n) * 4u);
+    std::memcpy(p + data_off, &k, 4u);
+
+    uint8_t* rec = p + data_off + 4u;
+    for (size_t i = 0; i < K; ++i) {
+        if (!subs[i]) continue;
+        ColDescriptor inner;
+        std::memcpy(&inner, subs[i]->data() + HEADER_BYTES, sizeof(inner));
+        const uint64_t shift = placed[i] - sub_payload;
+        if (inner.offsets_offset) inner.offsets_offset += shift;
+        inner.data_offset += shift;
+        inner.null_offset  = counts[i];  // repurposed: the alternative's row count
+        rec[0] = uint8_t(i);
+        std::memcpy(rec + 4u, &inner, sizeof(inner));
+        rec += record_bytes;
+        std::memcpy(p + placed[i], subs[i]->data() + sub_payload, subs[i]->size() - sub_payload);
+    }
+    return g.release();
+}
+
+template <typename Ret, typename AnyNull, typename Invoke>
 raw_buffer* write_result_column(uint32_t n, AnyNull any_null, Invoke invoke) {
     if constexpr (is_optional_v<Ret>) {
         using T = typename Ret::value_type;
         auto get = [&](uint32_t i) -> Ret { return any_null(i) ? Ret{} : Ret(invoke(i)); };
-        if constexpr (std::is_arithmetic_v<T>) {
+        if constexpr (is_fixed_value_v<T>) {
             if constexpr (std::is_same_v<T, bool>)
                 return write_nullable_fixed_column<uint8_t>(n, [&](uint32_t i) -> std::optional<uint8_t> {
                     auto v = get(i);
@@ -954,9 +1278,20 @@ raw_buffer* write_result_column(uint32_t n, AnyNull any_null, Invoke invoke) {
             }
             w.finish();
             return g.release();
+        } else if constexpr (is_pair_v<T> || is_tuple_v<T>) {
+            // Nullable(Tuple(...)): a top-level null map over COL_COMPLEX.
+            std::vector<T> vals(n);
+            std::vector<uint8_t> nulls(n);
+            for (uint32_t i = 0; i < n; ++i) {
+                Ret v = get(i);
+                nulls[i] = v ? 0u : 1u;
+                if (v) vals[i] = std::move(*v);
+            }
+            return write_complex_col<T>(n, [&](uint32_t i) -> const T& { return vals[i]; }, nulls.data());
         } else {
             static_assert(sizeof(T) == 0,
-                "write_result_column: std::optional supports arithmetic, std::string and bytes_codec types");
+                "write_result_column: std::optional supports fixed-width, std::string, "
+                "bytes_codec and tuple types (ClickHouse has no Nullable(Array) or Nullable(Map))");
         }
     } else if constexpr (std::is_same_v<Ret, bool>) {
         buffer_guard g{clickhouse_create_buffer(HEADER_BYTES + COL_DESC_BYTES + n)};
@@ -965,7 +1300,7 @@ raw_buffer* write_result_column(uint32_t n, AnyNull any_null, Invoke invoke) {
         for (uint32_t i = 0; i < n; ++i)
             res[i] = (!any_null(i) && invoke(i)) ? 1u : 0u;
         return g.release();
-    } else if constexpr (std::is_arithmetic_v<Ret>) {
+    } else if constexpr (is_fixed_value_v<Ret>) {
         buffer_guard g{clickhouse_create_buffer(HEADER_BYTES + COL_DESC_BYTES + n * uint32_t(sizeof(Ret)))};
         col_write_fixed_header<Ret>(g.buf, n, fixed_col_tag<Ret>());
         uint8_t* res = g.buf->data() + HEADER_BYTES + COL_DESC_BYTES;
@@ -998,6 +1333,8 @@ raw_buffer* write_result_column(uint32_t n, AnyNull any_null, Invoke invoke) {
         return write_complex_col<Ret>(n, [&](uint32_t i) -> Ret {
             return any_null(i) ? Ret{} : invoke(i);
         });
+    } else if constexpr (is_variant_v<Ret>) {
+        return write_variant_column<Ret>(n, any_null, invoke);
     } else {
         static_assert(sizeof(Ret) == 0,
             "write_result_column: unsupported result type; specialize ch::bytes_codec");
@@ -1023,9 +1360,13 @@ raw_buffer* columnar_call(raw_buffer* input, Ret (*impl)(Args...)) {
         std::array<ColView, nargs> cols;
         for (size_t j = 0; j < nargs; ++j) cols[j] = cb.col(static_cast<uint32_t>(j));
 
+        // A std::optional argument receives NULL itself; any other NULL
+        // argument skips the row.
+        constexpr std::array<bool, nargs> takes_null{is_optional_v<std::decay_t<Args>>...};
         auto any_null = [&](uint32_t row) {
             bool null = false;
-            for (size_t j = 0; j < nargs; ++j) null |= cols[j].is_null(row);
+            for (size_t j = 0; j < nargs; ++j)
+                if (!takes_null[j]) null |= cols[j].is_null(row);
             return null;
         };
         auto invoke = [&](uint32_t row) -> Ret {

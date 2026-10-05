@@ -49,32 +49,49 @@ argument and result types come from the C++ signature of `fn`.
 
 ## Types
 
-| C++ argument type | ClickHouse column |
-|---|---|
-| `bool`, integers, `float`, `double` | `UInt*`, `Int*`, `Float*`, `Bool`, `Date*`, `Decimal32/64` |
-| `std::string_view`, `std::string`, `std::span<const uint8_t>` | `String`, `FixedString(N)`, `LowCardinality(String)` |
-| `std::span<const uint8_t>` | also `UUID`, `IPv4/6`, `Int128`, `Decimal128/256` (raw bytes) |
-| `std::vector<T>` | `Array(T)` |
+Arguments and results use the same C++ types:
 
-| C++ result type | ClickHouse column |
+| C++ type | ClickHouse type |
 |---|---|
-| `bool`, integers, `float`, `double` | the fixed-width type of the same size |
-| `std::string` | `String` |
-| `std::vector<T>`, `std::pair<A,B>`, `std::tuple<...>` | `Array(T)`, `Tuple(...)`, nested |
-| `std::optional<T>` (T a number, `std::string` or a `bytes_codec` type) | `Nullable(T)` |
+| `bool`, integers, `float`, `double` | `Bool`, `UInt*`, `Int*`, `Float*`, `Date*`, `Decimal32/64` |
+| `std::array<uint8_t, N>` | any N-byte fixed type: `FixedString(N)`, `UUID`, `IPv6`, `Int128`, `Decimal128/256` |
+| `std::string`, `std::string_view` (argument only), `std::span<const uint8_t>` (argument only) | `String`, `FixedString(N)` |
+| `std::vector<T>` | `Array(T)`, nested to any depth |
+| `std::pair<A, B>`, `std::tuple<...>` | `Tuple(...)` |
+| `std::map<K, V>` | `Map(K, V)` |
+| `std::optional<T>` | `Nullable(T)`, also inside `Array`, `Tuple` and `Map` |
+| `std::variant<Ts...>` | `Variant(...)` |
+| `bytes_codec` types | `String` (see below) |
+
+`LowCardinality(T)` arguments arrive as their dictionary and are read as T.
+Declare the SQL result as plain T; the library writes it without a dictionary.
 
 The wire format does not say whether a fixed-width column is signed or a float.
 Declare the SQL argument type to match the C++ type. Narrower integer columns are
 widened to the declared C++ type, so `n UInt32` accepts the literal `3`, which
-ClickHouse sends as `UInt8`.
+ClickHouse sends as `UInt8`. ClickHouse does not convert types inside `Array`,
+`Tuple` and `Map` arguments: cast them to the declared type, for example
+`f([1, 2]::Array(Int64))`.
+
+### Variant
+
+ClickHouse orders the alternatives of a `Variant` by type name, and the
+discriminator is the position in that order. Write the `std::variant`
+alternatives in the same order: `Variant(String, Int64)` is
+`std::variant<int64_t, std::string>` (`Int64` sorts before `String`).
 
 ### NULL
 
-If any argument of a row is NULL, your function is not called for that row. With
-a `std::optional<T>` result, that row is NULL, and so is every row where your
+A `std::optional` argument receives NULL as `std::nullopt`. If any other argument
+of a row is NULL, your function is not called for that row. With a
+`std::optional<T>` result, that row is NULL, and so is every row where your
 function returns `std::nullopt`; declare the SQL result as `Nullable(T)`. Without
 `std::optional`, the result for that row is NaN for floating-point results, `0`
-for other numbers, an empty string for strings, and `T{}` for arrays and tuples.
+for other numbers, an empty string for strings, `T{}` for arrays, tuples and
+maps, and NULL for a `std::variant`.
+
+ClickHouse has no `Nullable(Array)` or `Nullable(Map)`, so `std::optional` of a
+vector or map is not a valid result type; `Nullable(Tuple)` is.
 
 ## Your own types
 
@@ -138,7 +155,8 @@ target_link_options(mymodule PRIVATE -fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=
 ClickHouse's wasmtime runtime needs native WASM exceptions in the new `exnref`
 form. Emscripten 3.x uses `-sWASM_EXNREF=1` for this.
 
-`examples/demo.cpp` has five functions (strings, `Nullable`, arrays, tuples,
+`examples/demo.cpp` has one function for each supported shape (strings,
+`Nullable`, nested arrays, tuples, maps, `Variant`, `LowCardinality`, `UUID`,
 errors) and `examples/demo.sql` registers them. Build it with Emscripten:
 
 ```sh

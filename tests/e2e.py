@@ -21,6 +21,18 @@ FUNCTIONS = {
     "demo_array_mean": ("xs Array(Float64)",       "Float64"),
     "demo_split":      ("s String, sep String",    "Array(String)"),
     "demo_divmod":     ("a Int64, b Int64",        "Tuple(Int64, Int64)"),
+    "demo_tuple_sum":  ("t Tuple(Int64, Float64)", "Float64"),
+    "demo_flatten":    ("xss Array(Array(Int64))", "Array(Int64)"),
+    "demo_upper_all":  ("xs Array(Nullable(String))", "Array(Nullable(String))"),
+    "demo_map_get":    ("m Map(String, Int64), k String", "Nullable(Int64)"),
+    "demo_map_invert": ("m Map(String, Int64)",    "Map(Int64, String)"),
+    "demo_describe":   ("v Variant(Int64, String)", "String"),
+    "demo_classify":   ("s String",                "Variant(Int64, String)"),
+    "demo_show_nullable": ("v Nullable(Int64)",    "String"),
+    "demo_halves":     ("v Int64",                 "Nullable(Tuple(Int64, Int64))"),
+    "demo_uuid_bytes": ("u UUID",                  "String"),
+    "demo_lc_fixed":   ("s LowCardinality(FixedString(3))", "String"),
+    "demo_lc_double":  ("v LowCardinality(UInt32)", "UInt64"),
 }
 
 # (query, expected TSV output)
@@ -36,6 +48,29 @@ CASES = [
     ("SELECT demo_split('a,b,,c', ',')", "['a','b','','c']"),
     ("SELECT demo_divmod(17, 5)", "(3,2)"),
     ("SELECT demo_divmod(-7, 2)", "(-3,-1)"),
+    ("SELECT demo_tuple_sum((2, 0.5)::Tuple(Int64, Float64))", "2.5"),
+    ("SELECT demo_tuple_sum(t) FROM values('t Tuple(Int64, Float64)', (1, 1.5), (-3, 0.25)) ORDER BY t",
+     "-2.75\n2.5"),
+    ("SELECT demo_flatten([[1, 2], [], [3]]::Array(Array(Int64)))", "[1,2,3]"),
+    ("SELECT demo_flatten(xss) FROM values('xss Array(Array(Int64))', [[]], [[5], [6, 7]]) ORDER BY length(xss)",
+     "[]\n[5,6,7]"),
+    ("SELECT demo_upper_all(['ab', NULL, 'c'])", "['AB',NULL,'C']"),
+    ("SELECT demo_map_get(map('a', 1, 'b', 2)::Map(String, Int64), 'b')", "2"),
+    ("SELECT demo_map_get(map('a', 1)::Map(String, Int64), 'z')", "\\N"),
+    ("SELECT demo_map_invert(map('a', 1, 'b', 2)::Map(String, Int64))", "{1:'a',2:'b'}"),
+    ("SELECT demo_describe(v) AS d FROM (SELECT arrayJoin([42::Variant(Int64, String), 'x'::Variant(Int64, String)]) AS v) ORDER BY d",
+     "int:42\nstr:x"),
+    ("SELECT demo_describe(NULL::Variant(Int64, String))", ""),
+    ("SELECT demo_classify(s), variantType(demo_classify(s)) FROM values('s String', '12', 'ab') ORDER BY s",
+     "12\tInt64\nab\tString"),
+    ("SELECT demo_show_nullable(v) FROM values('v Nullable(Int64)', 5, NULL) ORDER BY v", "5\nnull"),
+    ("SELECT demo_halves(v) FROM values('v Int64', 7, -1) ORDER BY v", "\\N\n(3,4)"),
+    ("SELECT demo_uuid_bytes(u) = lower(hex(reinterpretAsFixedString(u))) "
+     "FROM (SELECT toUUID('00112233-4455-6677-8899-aabbccddeeff') AS u)", "1"),
+    ("SELECT demo_lc_fixed(s) FROM (SELECT toLowCardinality(toFixedString(arrayJoin(['abc', 'xyz', 'abc']), 3)) AS s)",
+     "abc!\nxyz!\nabc!"),
+    ("SELECT demo_lc_double(v) FROM (SELECT toLowCardinality(toUInt32(arrayJoin([3, 5, 3]))) AS v) "
+     "SETTINGS allow_suspicious_low_cardinality_types = 1", "6\n10\n6"),
     # A constant argument broadcast over many rows, then aggregated.
     ("SELECT sum(length(demo_repeat('abc', toUInt32(number % 4)))) FROM numbers(100000)", "450000"),
 ]
@@ -45,10 +80,11 @@ ERROR_CASES = [
 ]
 
 
-def run(ch, port, query, stdin=None):
+def run(ch, port, query):
+    # The query goes over stdin: the module INSERT is too long for argv.
     return subprocess.run(
-        [ch, "client", "--port", str(port), "--query", query],
-        input=stdin, capture_output=True, text=True, timeout=120)
+        [ch, "client", "--port", str(port)],
+        input=query, capture_output=True, text=True, timeout=120)
 
 
 def main():
@@ -60,8 +96,8 @@ def main():
 
     code = base64.b64encode(pathlib.Path(args.wasm).read_bytes()).decode()
 
-    def q(query, stdin=None):
-        r = run(args.clickhouse, args.port, query, stdin)
+    def q(query):
+        r = run(args.clickhouse, args.port, query)
         if r.returncode != 0:
             raise RuntimeError(f"{query[:80]}...\n{r.stderr.strip()}")
         return r.stdout.rstrip("\n")
