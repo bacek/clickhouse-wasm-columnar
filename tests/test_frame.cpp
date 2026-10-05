@@ -442,8 +442,10 @@ TEST(ColumnarLowCard, IndexPastDictionaryThrows) {
 //
 // The host's Variant branch of writeColData places the per-row positions as
 // uint32[num_rows] at offsets_offset, and the host reader loads them back as
-// uint32. This frame is a verbatim dump of that writer (rows:
-// UInt64(10), String("hi"), UInt64(20), NULL — positions {0,0,1,0}). A decoder
+// uint32. This frame is a verbatim dump of that writer for
+// Variant(UInt64, String), whose alternatives ClickHouse sorts to
+// (String, UInt64) (rows: UInt64(1), String("hi"), NULL, UInt64(2) —
+// positions {0,0,0,1}). A decoder
 // walking the array as the uint64 COL_BYTES offsets uses reads two adjacent
 // positions per step and mislocates rows; validation sized for uint64 would
 // also reject legitimate short frames. See ColView::variant_offset_at.
@@ -460,14 +462,13 @@ TEST(ColumnarVariant, HostFrameRowOffsetsAreUint32) {
     // Discriminators live at null_offset (0xFF = NULL row).
     ASSERT_FALSE(col.is_null(0));
     ASSERT_FALSE(col.is_null(1));
-    ASSERT_FALSE(col.is_null(2));
-    ASSERT_TRUE(col.is_null(3));
+    ASSERT_TRUE(col.is_null(2));
+    ASSERT_FALSE(col.is_null(3));
 
     // Positions within each sub-column, read at their wire width.
     EXPECT_EQ(col.variant_offset_at(0), 0u);
     EXPECT_EQ(col.variant_offset_at(1), 0u);
-    EXPECT_EQ(col.variant_offset_at(2), 1u);
-    EXPECT_EQ(col.variant_offset_at(3), 0u);
+    EXPECT_EQ(col.variant_offset_at(3), 1u);
 }
 
 TEST(ColumnarVariant, Uint32SizedOffsetArrayAccepted) {

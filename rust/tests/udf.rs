@@ -213,20 +213,20 @@ fn variant_null_row_and_host_fixture() {
     let out = IntOrStr::write_column(vec![None, Some(IntOrStr::Str("x".into()))]).unwrap();
     assert_eq!(rows::<String>(&t_describe::call(&out).unwrap()), s(&["null", "str:x"]));
 
-    // Host-written Variant(UInt64, String): alternatives in that order.
-    column_variant! { enum U64OrStr { U(u64), S(String) } }
+    // Host-written Variant(UInt64, String): ClickHouse sorts the
+    // alternatives by type name, so String is 0 and UInt64 is 1.
+    column_variant! { enum StrOrU64 { S(String), U(u64) } }
     let b = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/wire_fixtures/variant_u64_string.bin")).unwrap();
     let f = Frame::parse(&b).unwrap();
     let c = f.col(0).unwrap();
     let got: Vec<String> = (0..f.num_rows()).map(|r| {
-        match clickhouse_wasm_columnar::read_arg::<Option<U64OrStr>>(&c, r).unwrap() {
-            Some(U64OrStr::U(v)) => v.to_string(),
-            Some(U64OrStr::S(s)) => s,
+        match clickhouse_wasm_columnar::read_arg::<Option<StrOrU64>>(&c, r).unwrap() {
+            Some(StrOrU64::U(v)) => format!("u:{v}"),
+            Some(StrOrU64::S(s)) => format!("s:{s}"),
             None => "NULL".into(),
         }
     }).collect();
-    assert!(!got.is_empty());
-    assert!(got.iter().any(|g| g == "NULL") || got.iter().all(|g| !g.is_empty()));
+    assert_eq!(got, ["u:1", "s:hi", "NULL", "u:2"]);
 }
 
 #[test]

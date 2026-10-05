@@ -368,16 +368,15 @@ TEST(ColumnarVariant, WrittenVariantReadsBack) {
 }
 
 TEST(ColumnarVariant, HostFrameDecodesTyped) {
-    // Host fixture: rows UInt64(10), String("hi"), UInt64(20), NULL, from a
-    // ColumnVariant built with alternatives (UInt64, String) in that order, so
-    // discriminator 0 is UInt64.  (A SQL Variant type sorts its alternatives by
-    // name; tests/e2e.py covers that order against a server.)
+    // Host fixture for Variant(UInt64, String): rows UInt64(1), String("hi"),
+    // NULL, UInt64(2). ClickHouse sorts the alternatives by type name, so
+    // discriminator 0 is String and 1 is UInt64.
     auto* in = frame_from_bytes(wire_fixture::VARIANT_U64_STRING, wire_fixture::VARIANT_U64_STRING_len);
-    auto out = read_string_result(columnar_call(in, +[](std::variant<uint64_t, std::string> v) {
-        return v.index() == 1 ? "s:" + std::get<1>(v) : "u:" + std::to_string(std::get<0>(v));
+    auto out = read_string_result(columnar_call(in, +[](std::variant<std::string, uint64_t> v) {
+        return v.index() == 0 ? "s:" + std::get<0>(v) : "u:" + std::to_string(std::get<1>(v));
     }));
     destroy(in);
-    EXPECT_EQ(out, (std::vector<std::string>{"u:10", "s:hi", "u:20", ""}));
+    EXPECT_EQ(out, (std::vector<std::string>{"u:1", "s:hi", "", "u:2"}));
 }
 
 TEST(ColumnarNullableArg, OptionalArgumentSeesNull) {
