@@ -486,3 +486,9 @@ TEST(ColumnarVariant, Uint32SizedOffsetArrayAccepted) {
     EXPECT_NO_THROW((void)cb.col(0));
     clickhouse_destroy_buffer(reinterpret_cast<uint8_t*>(buf));
 }
+
+// A null handle (what the host passes when there is no input frame) must
+// panic with a message, not dereference null.
+TEST(ColumnarFrame, NullHandlePanics) {
+    EXPECT_THROW(parse_columnar(nullptr), WasmPanic);
+}

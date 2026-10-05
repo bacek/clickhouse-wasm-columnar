@@ -528,6 +528,8 @@ private:
 };
 
 inline ColumnarBuf parse_columnar(const raw_buffer* buf) {
+    if (!buf)
+        panic("columnar: no input frame (null buffer handle)");
     const uint8_t* p = buf->data();
     const uint64_t total = buf->size();
     if (total < HEADER_BYTES)
