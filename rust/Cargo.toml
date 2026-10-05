@@ -1,0 +1,9 @@
+[package]
+name = "clickhouse-wasm-columnar"
+version = "1.0.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Write ClickHouse WebAssembly UDFs with the COLUMNAR_V1 ABI"
+repository = "https://github.com/bacek/clickhouse-wasm-columnar"
+
+[dependencies]
