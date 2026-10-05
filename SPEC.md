@@ -137,7 +137,10 @@ so `dict_rows >= 1`.
 
 ClickHouse refuses `LowCardinality(Nullable(T))` arguments and
 `LowCardinality` results when the function is created, so neither appears on
-the wire.
+the wire. A nullable value passed to a `LowCardinality(T)` argument is refused
+when the query is analysed. A `LowCardinality(Nullable(T))` value passed to a
+plain `T` argument is cast to `Nullable(T)` and arrives as a nullable column,
+not as `COL_LOWCARD`.
 
 ## The result frame
 

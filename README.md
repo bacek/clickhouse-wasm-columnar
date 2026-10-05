@@ -101,6 +101,10 @@ function declares a `Nullable` argument:
 | `COLUMNAR_V1` | no `Nullable` | not sent; ClickHouse returns NULL for that row itself |
 | `BUFFERED_V1` and older ABIs | any | not sent; ClickHouse returns NULL for that row itself |
 
+Where ClickHouse returns NULL itself, a result type that cannot be `Nullable`
+(`Array`, `Tuple`, `Map`) is the exception: the row is sent with the default
+value in place of the NULL, and the module's result is returned.
+
 ClickHouse has no `Nullable(Array)` or `Nullable(Map)`, so `std::optional` of a
 vector or map is not a valid result type; `Nullable(Tuple)` is.
 
