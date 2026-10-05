@@ -90,8 +90,24 @@ function returns `std::nullopt`; declare the SQL result as `Nullable(T)`. Withou
 for other numbers, an empty string for strings, `T{}` for arrays, tuples and
 maps, and NULL for a `std::variant`.
 
+How a NULL argument reaches the module depends on the ABI and on whether the
+function declares a `Nullable` argument:
+
+| ABI | Declared arguments | NULL rows |
+|---|---|---|
+| `COLUMNAR_V1` | at least one `Nullable(T)` | sent to the module, with the null map set; the module decides the result |
+| `COLUMNAR_V1` | no `Nullable` | not sent; ClickHouse returns NULL for that row itself |
+| `BUFFERED_V1` and older ABIs | any | not sent; ClickHouse returns NULL for that row itself |
+
 ClickHouse has no `Nullable(Array)` or `Nullable(Map)`, so `std::optional` of a
 vector or map is not a valid result type; `Nullable(Tuple)` is.
+
+## Wire format
+
+[SPEC.md](SPEC.md) describes the frame byte by byte.
+[`clickhouse_wasm/wire.h`](include/clickhouse_wasm/wire.h) has its constants and
+structs as plain C, for modules in other languages. Releases `v1.x` of this
+library use frame version 1.
 
 ## Your own types
 
