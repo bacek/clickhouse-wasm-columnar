@@ -309,3 +309,59 @@ impl<'a> ColView<'a> {
         Ok(i as u32)
     }
 }
+
+/// One row of a Variant column: which alternative holds it, and where.
+pub struct VariantRow<'a> {
+    pub discriminator: u8,
+    /// The alternative's column.
+    pub alternative: ColView<'a>,
+    /// The row's position inside `alternative`.
+    pub offset: u32,
+}
+
+impl<'a> ColView<'a> {
+    /// A Variant row, or `None` for NULL.
+    pub fn variant_row(&self, row: u32) -> Result<Option<VariantRow<'a>>> {
+        if self.tag != ColTag::Variant {
+            return err("Variant argument against a column that is not COL_VARIANT");
+        }
+        let (Some(discs), Some(offs)) = (self.null_map, self.offsets) else {
+            return err("COL_VARIANT column without discriminators or row offsets");
+        };
+        let r = self.stored_row(row)? as usize;
+        let d = discs[r];
+        if d == VARIANT_NULL_DISCRIMINATOR {
+            return Ok(None);
+        }
+        let offset = u32_at(offs, r * 4);
+        if self.data.len() < 4 {
+            return err("COL_VARIANT header truncated");
+        }
+        let k = u32_at(self.data, 0) as usize;
+        const RECORD: usize = 4 + COL_DESC_BYTES;
+        if k > (self.data.len() - 4) / RECORD {
+            return err("COL_VARIANT header records extend past the column data");
+        }
+        for i in 0..k {
+            let rec = &self.data[4 + i * RECORD..4 + (i + 1) * RECORD];
+            if rec[0] != d {
+                continue;
+            }
+            let mut inner = ColDescriptor::read(&rec[4..]);
+            let rows = inner.null_offset; // repurposed: the alternative's row count
+            if rows > u32::MAX as u64 {
+                return err("COL_VARIANT alternative row count too large");
+            }
+            inner.null_offset = 0;
+            // The alternative must lie inside this column's data.
+            let end = self.data.as_ptr() as usize + self.data.len() - self.frame.bytes.as_ptr() as usize;
+            let region = Frame { bytes: &self.frame.bytes[..end], ..self.frame };
+            let alternative = region.view(&inner, rows as u32)?;
+            if offset as u64 >= rows {
+                return err("COL_VARIANT row offset past its alternative");
+            }
+            return Ok(Some(VariantRow { discriminator: d, alternative, offset }));
+        }
+        err("COL_VARIANT row refers to an alternative missing from the header")
+    }
+}
