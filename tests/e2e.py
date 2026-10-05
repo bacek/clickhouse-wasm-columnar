@@ -83,7 +83,7 @@ ERROR_CASES = [
 def run(ch, port, query):
     # The query goes over stdin: the module INSERT is too long for argv.
     return subprocess.run(
-        [ch, "client", "--port", str(port)],
+        [ch, "client", "--port", str(port), "--max_query_size", "67108864"],
         input=query, capture_output=True, text=True, timeout=120)
 
 

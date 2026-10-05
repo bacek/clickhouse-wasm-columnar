@@ -8,6 +8,8 @@ column is one typed buffer, laid out the same way as the ClickHouse column in
 memory. A constant column is sent once, not once per row. This library decodes
 that frame, calls your function for each row, and encodes the result.
 
+Writing Rust instead? See [rust/](rust/README.md): same frames, same tests.
+
 ## Requirements
 
 - ClickHouse with WASM UDFs and the `COLUMNAR_V1` ABI. Upstream ClickHouse does
